@@ -2829,6 +2829,14 @@ interface ElectronAPI {
     >;
     /** 取消进行中的 chatFetch / chatDownload(按发起时的 requestId);已结束时无操作。 */
     chatCancel: (requestId: string) => Promise<void>;
+    uploadChatFolder: (params: {
+      deviceId: string;
+      sourcePath: string;
+      requestId: string;
+    }) => Promise<
+      | { ok: true; path: string }
+      | { ok: false; code: 'REMOTE_UNSUPPORTED' | 'TRANSFER_FAILED' }
+    >;
     /** 聊天流文件 chip 点亮预检:远端精确 stat。file=点亮;nonfile=保持纯文本;unknown=乐观点亮。 */
     chatStat: (params: {
       origin: { kind: 'device'; deviceId: string } | { kind: 'ssh'; remoteHostId: string };

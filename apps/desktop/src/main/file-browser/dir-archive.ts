@@ -20,8 +20,13 @@ import { pipeline } from 'node:stream/promises';
 import * as tar from 'tar';
 
 /** 打包整个目录(条目以 `./` 为根)。onSkip 在单个条目读不出时调用,打包继续。 */
-export function packDirectory(dir: string, onSkip: () => void): Readable {
-  return tar.c({ cwd: dir, portable: true, follow: false, strict: false, onwarn: () => onSkip() }, [
+export function packDirectory(dir: string, onSkip: () => void, scratchDirectory?: string): Readable {
+  return tar.c({
+    cwd: dir, portable: true, follow: false, strict: false, onwarn: () => onSkip(),
+    // The user's folder can contain the OS temp directory (notably a Windows
+    // home folder). Never recursively archive this transfer's own scratch files.
+    filter: (name) => !scratchDirectory || !isInside(scratchDirectory, path.resolve(dir, name)),
+  }, [
     '.',
   ]) as unknown as Readable;
 }
@@ -35,7 +40,7 @@ function isInside(root: string, target: string): boolean {
  * 把 tar 流解到 `dest`(必须已存在且为空)。返回跳过的条目数。
  * 流本身损坏(截断、格式错误)时 reject。
  */
-export async function extractDirectoryArchive(input: Readable, dest: string): Promise<number> {
+export async function extractDirectoryArchive(input: Readable, dest: string, signal?: AbortSignal): Promise<number> {
   const root = await fsp.realpath(dest);
   const links: Array<{ name: string; target: string }> = [];
   let skipped = 0;
@@ -56,8 +61,10 @@ export async function extractDirectoryArchive(input: Readable, dest: string): Pr
         return true;
       },
     }) as unknown as NodeJS.WritableStream,
+    { signal },
   );
   for (const link of links) {
+    signal?.throwIfAborted();
     try {
       const normalized = path.normalize(link.name);
       if (!link.target || path.isAbsolute(normalized) || normalized.split(path.sep).includes('..'))

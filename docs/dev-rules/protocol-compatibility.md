@@ -679,6 +679,22 @@ SSH 远程不经 file-service，直接在 SSH exec 通道上流式传回远端 `
 relay 类型、allowlist 或持久化 schema，服务端无需改动；Mobile 未接入。实现见
 `apps/desktop/src/main/file-browser/chat-download.ts`、`dir-export.ts` 与 `dir-archive.ts`。
 
+## 远程聊天发送本机文件夹
+
+桌面拖入／粘贴本机文件夹时，控制端通过本地 `maker:chat-folder:upload` 自动打包并复用
+已有分段附件传输（直连优先、OSS 回退）。`file-browser:remote-op` 的 `caps` 新增可选
+`folderImport`；缺少能力时明确提示更新，不把控制端路径当作远程目录发送。
+`importDirStart { name, file }` 立即返回 `transferId`，`importDirStatus { transferId }`
+返回 receiving / extracting / done / error；done 才提供接收端目录路径。
+`importDirCancel` 取消该次导入。导入绑定调用上下文的同账号控制端与当前数据 owner，
+共享访客拒绝；目标由宿主生成于 owner 隔离的附件目录，调用方不能指定落盘位置。
+新建任务草稿无需工作目录。打包／解包不完整时整次失败，不静默遗漏文件。
+目录引用只在传输完成后插入，发送等待完成，失败保留草稿，切换任务／取消后不插入迟到结果。
+当前任务文件栏的目录拖拽携带来源标记，继续直接引用。SSH 入口目前明确提示不支持，
+不传本机路径；手机没有本机目录拖拽入口。本次不改 relay、服务端或持久化 schema。
+实现与回归见 `file-browser/chat-folder-transfer.ts`、`chatFolderTransfer.test.ts` 和
+`chatInputAnnotationAbort.test.tsx`。
+
 ## 任务列表标签目录
 
 `sessions:list` 第三个参数可追加 `tagCatalog: 1`。支持的主机仅对该请求返回

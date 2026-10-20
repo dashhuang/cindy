@@ -22,6 +22,8 @@ import { CINDY_MAKE_ENABLED } from '@cindy/maker-shared/cindy-make-feature';
 import { requiresFullAccessConfirmation } from '@cindy/maker-shared/permission-mode';
 import { isAnnotationBurnInError } from '@/lib/annotationBurnIn';
 import { AttachmentRejectionStrip, ThumbnailStrip } from './ComposerAttachments';
+import { ComposerFolderTransfers, useComposerFolderTransfers } from './ComposerFolderTransfers';
+import type { PendingFolder } from '@/hooks/useAttachments';
 import { FullAccessConfirmContent } from './FullAccessConfirmContent';
 import { useEditor, EditorContent } from '@tiptap/react';
 import Document from '@tiptap/extension-document';
@@ -727,9 +729,9 @@ interface ChatInputProps {
     rejections: { id: string; message: string }[];
     dismissRejection: (id: string) => void;
     clearRejections: () => void;
-    addFolderPath: (folderPath: string) => void;
+    addFolderPath: (folderPath: string, source?: 'task') => void;
     pendingFoldersVersion: number;
-    consumePendingFolders: () => string[];
+    consumePendingFolders: () => PendingFolder[];
     addFileMention: (payload: { type: 'file'; relPath: string; name: string }) => void;
     pendingFileMentionsVersion: number;
     consumePendingFileMentions: () => Array<{ type: 'file'; relPath: string; name: string }>;
@@ -2202,9 +2204,11 @@ export function ChatInput({
   // 避免快照后的编辑被成功清理误删。乐观清空后只放开打字；发送按钮和设置控件仍由
   // sendDispatchInFlight 锁到 onSend 结算，避免按钮亮着点了却被 in-flight guard 静默丢掉。
   const [sendDispatchInFlight, setSendDispatchInFlight] = useState(false);
+  const [waitingForFolders, setWaitingForFolders] = useState(false);
+  const waitingForFoldersRef = useRef(false);
   const [allowTypeDuringSend, setAllowTypeDuringSend] = useState(false);
-  queueEditCancelAllowedRef.current = !sendDispatchInFlight;
-  const composerEditorLocked = disabled || sendDispatchInFlight;
+  queueEditCancelAllowedRef.current = !sendDispatchInFlight && !waitingForFolders;
+  const composerEditorLocked = disabled || sendDispatchInFlight || waitingForFolders;
   const composerMutationLockedRef = useRef(composerEditorLocked);
   composerMutationLockedRef.current = composerEditorLocked;
 
@@ -3307,7 +3311,7 @@ export function ChatInput({
   });
   const composerMutationLocked = composerEditorLocked || voiceBusyOnCurrentComposer;
   const composerTypingLocked =
-    disabled || (sendDispatchInFlight && !allowTypeDuringSend) || voiceBusyOnCurrentComposer;
+    disabled || waitingForFolders || (sendDispatchInFlight && !allowTypeDuringSend) || voiceBusyOnCurrentComposer;
   composerMutationLockedRef.current = composerTypingLocked;
   useEffect(() => {
     editor?.setEditable(!composerTypingLocked);
@@ -4274,23 +4278,37 @@ export function ChatInput({
     [discardBrowserComments],
   );
 
-  // ── Folder drop → @dir mention chip ──
-  // When pending folder paths arrive (from any drop zone), insert them as
-  // @dir mention chips in the editor.
+  const folderTransfers = useComposerFolderTransfers({
+    scope: `${storageKey ?? sessionId ?? ''}:${deviceLinkDeviceId ?? ''}:${remoteHostId ?? ''}`,
+    deviceId: deviceLinkDeviceId,
+    remoteHostId,
+    insert: (folderPath, folderName) => {
+      if (!editor || editor.isDestroyed) return;
+      appendMentionChip(editor, { kind: 'dir', label: folderName, path: folderPath });
+    },
+  });
+  const waitForFolders = useCallback(async () => {
+    if (waitingForFoldersRef.current) return false;
+    if (!folderTransfers.hasPending) return true;
+    waitingForFoldersRef.current = true;
+    setWaitingForFolders(true);
+    try {
+      return await folderTransfers.wait();
+    } finally {
+      waitingForFoldersRef.current = false;
+      setWaitingForFolders(false);
+    }
+  }, [folderTransfers.hasPending, folderTransfers.wait]);
+
+  // OS folders are copied to the task's computer; task-browser mentions already
+  // belong to that computer and stay references.
   useEffect(() => {
     if (!editor) return;
     if (pendingFoldersVersion === 0) return;
     const paths = consumePendingFolders();
     if (paths.length === 0) return;
-    for (const folderPath of paths) {
-      const folderName = folderPath.split(/[\\/]/).filter(Boolean).pop() ?? folderPath;
-      appendMentionChip(editor, {
-        kind: 'dir',
-        label: folderName,
-        path: folderPath,
-      });
-    }
-  }, [editor, consumePendingFolders, pendingFoldersVersion]);
+    for (const pending of paths) folderTransfers.add(pending);
+  }, [editor, consumePendingFolders, pendingFoldersVersion, folderTransfers.add]);
 
   useEffect(() => {
     if (!editor) return;
@@ -5238,6 +5256,8 @@ export function ChatInput({
     async (deliveryMode: MessageDeliveryMode = 'queue') => {
       if (!editor) return;
       if (disabled || sessionModelLoading) return;
+      if ((folderTransfers.hasPending || waitingForFoldersRef.current) &&
+          (!(await waitForFolders()) || editor.isDestroyed)) return;
       // React 的 disabled 状态可能尚未完成下一帧渲染；同步读协调器兜住点击、快捷键、
       // 语音发送等所有入口，确保 host 已登记切换意图后才允许 maker:send。
       if (sessionId && hasPendingAgentSendDispatch(sessionId)) return;
@@ -6093,6 +6113,8 @@ export function ChatInput({
       editor,
       disabled,
       sessionModelLoading,
+      waitForFolders,
+      folderTransfers.hasPending,
       sessionId,
       onSend,
       activeModel,
@@ -6168,6 +6190,8 @@ export function ChatInput({
     ) {
       return;
     }
+    if ((folderTransfers.hasPending || waitingForFoldersRef.current) &&
+        (!(await waitForFolders()) || editor.isDestroyed)) return;
     const content = serializeEditorContent(editor);
     if (content.text.trim().length === 0 && attachments.length === 0) return;
 
@@ -6192,6 +6216,8 @@ export function ChatInput({
     onQueueEditSubmit,
     queueEditingClientId,
     sendDispatchInFlight,
+    waitForFolders,
+    folderTransfers.hasPending,
     t,
     voiceBusyOnCurrentComposer,
   ]);
@@ -8687,7 +8713,7 @@ export function ChatInput({
     return () => observer.disconnect();
   }, [showPromptPreview]);
   // 可见推荐本身就是一次可发送输入：按钮点击时会先把它同步写入正文，再走现有发送链。
-  const canSend = hasComposerPayload || showRecommendationOverlay;
+  const canSend = hasComposerPayload || showRecommendationOverlay || folderTransfers.hasPending;
   const makeNeedsNoModel = CINDY_MAKE_ENABLED && (noConnectedSource || selectedSourceDisconnected) && !!editor &&
     !hasAttachments && classifyCindyMakeCommand(
       serializeEditorContent(editor).text, slashCommandsReady ? mergedCommands : null,
@@ -8695,13 +8721,13 @@ export function ChatInput({
   const [voiceReleaseToSendActive, setVoiceReleaseToSendActive] = useState(false);
   const sendButtonDisabled = queueEditActive
     ? Boolean(
-        disabled ||
+        disabled || waitingForFolders ||
           sendDispatchInFlight ||
           voiceBusyOnCurrentComposer ||
           (!hasMessage && !hasAttachments),
       )
     : Boolean(
-    disabled || sessionModelLoading ||
+    disabled || sessionModelLoading || waitingForFolders ||
     // 空態:当前 agent 无已连接来源 → Send 禁用(设计 Q7NYAD「send 置灰」),引导用户先去连接来源。
     (!makeNeedsNoModel && noConnectedSource) ||
     // 会话显式选中的来源已断开 → Send 禁用(trigger 同步显示「已断开」错误态说明原因)。
@@ -9133,6 +9159,7 @@ export function ChatInput({
             )}
 
             {/* Thumbnail strip (F-FI-3) — above EditorContent */}
+            <ComposerFolderTransfers rows={folderTransfers.rows} onRemove={folderTransfers.remove} />
             {hasAttachments && (
               <ThumbnailStrip
                 attachments={attachments}

@@ -73,6 +73,10 @@ import { watcherManager, type FileTreeEvent } from './watcher.js';
 import { registerHtmlPreviewIpc } from './html-preview-ipc.js';
 import { statSshPreviewMetadata } from './html-preview-read.js';
 import { toWorkdirRel } from '../../shared/workdirPath.js';
+import { activeOwnerScopeKey, isAppSessionBoundaryPending } from '../appSessionState.js';
+import { createDirExportDeps } from './dir-export.js';
+import { uploadChatFolder, type ChatFolderUploadArgs } from './chat-folder-transfer.js';
+import { parseSharedTaskPeer } from '@cindy/device-link';
 
 const log = createLogger('file-browser/ipc');
 
@@ -109,6 +113,7 @@ export const FILE_BROWSER_INVOKE = {
   CHAT_FILE_DOWNLOAD: 'maker:chat-file:download',
   /** 取消进行中的聊天文件取回 / 下载(按发起时的 requestId)。 */
   CHAT_FILE_CANCEL: 'maker:chat-file:cancel',
+  CHAT_FOLDER_UPLOAD: 'maker:chat-folder:upload',
 } as const;
 
 export const FILE_BROWSER_PUSH = {
@@ -646,6 +651,37 @@ export function registerFileBrowserIpc(): void {
     assertTrustedAppRendererEvent(event);
     const key = chatTransferKey(event.sender, requestId);
     if (key) chatTransfers.get(key)?.abort();
+  });
+
+  ipcMain.handle(FILE_BROWSER_INVOKE.CHAT_FOLDER_UPLOAD, async (event, args: ChatFolderUploadArgs) => {
+    assertTrustedAppRendererEvent(event);
+    const owner = activeOwnerScopeKey();
+    const transfer = beginChatTransfer(event.sender, args?.requestId);
+    const assertCurrent = () => {
+      assertTrustedAppRendererEvent(event);
+      if (event.sender.isDestroyed() || isAppSessionBoundaryPending() ||
+          owner !== activeOwnerScopeKey()) throw new Error('CANCELLED');
+    };
+    const progress = createFileTransferProgressReporter({
+      workdir: '', relPath: args?.sourcePath ?? '', requestId: args?.requestId,
+    }, value => {
+      if (!event.sender.isDestroyed()) event.sender.send(FILE_BROWSER_PUSH.TRANSFER, value);
+    });
+    try {
+      if (!fileTransferRequestId(args?.requestId) || !args?.deviceId ||
+          parseSharedTaskPeer(args.deviceId)) throw new Error('REMOTE_UNSUPPORTED');
+      const uploadedPath = await uploadChatFolder(args, {
+        ...createDirExportDeps(), assertCurrent,
+        op: (deviceId, request) => deviceOpInvoke(deviceId, request),
+      }, progress, transfer.signal);
+      assertCurrent();
+      return { ok: true as const, path: uploadedPath };
+    } catch (error) {
+      return { ok: false as const, code: String(error).includes('REMOTE_UNSUPPORTED')
+        ? 'REMOTE_UNSUPPORTED' as const : 'TRANSFER_FAILED' as const };
+    } finally {
+      transfer.end();
+    }
   });
 
   // chip 点亮预检:远端精确 stat,verdict 见 statChatFile 注释。查询型接口,

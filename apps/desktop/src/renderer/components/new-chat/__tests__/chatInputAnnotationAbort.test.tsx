@@ -38,6 +38,7 @@ const h = vi.hoisted(() => ({ t: (key: string) => key, confirm: vi.fn(), editor:
   realModelSelector: false,
   listAgentSkills: vi.fn(),
   localProviders: [] as ProviderView[],
+  uploadChatFolder: vi.fn(),
 }));
 
 vi.mock('react-i18next', async (original) => ({ ...await original<typeof import('react-i18next')>(), useTranslation: () => ({ t: h.t }) }));
@@ -99,6 +100,8 @@ const noOp = () => {};
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const api: any = new Proxy({}, { get: (_obj, key) => {
   if (key === 'setModel') return h.setModel;
+  if (key === 'uploadChatFolder') return h.uploadChatFolder;
+  if (key === 'getFilePath') return () => '/controller/docs';
   if (key === 'listAgentSkills') return h.listAgentSkills;
   if (key === 'listAgentCommands' || key === 'listDesktopCommands') return async () => ({ success: true, commands: [] });
   if (key === 'listSync') return () => ({ ghosts: [] });
@@ -125,6 +128,7 @@ const annotatedImage: AttachedFile = {
 };
 
 beforeEach(() => {
+  h.uploadChatFolder.mockReset();
   h.listAgentSkills.mockReset().mockResolvedValue({ success: true, skills: [] });
   h.localProviders = [];
   h.editor = null;
@@ -447,6 +451,112 @@ it('inserts queued folders into the mounted editor when the real attachment hook
   expect(Array.from(chips, chip => chip.getAttribute('data-path'))).toEqual([
     '/workspace/docs', '/workspace/src',
   ]);
+});
+
+// Remote-folder regression: the real editor and send pipeline must never
+// serialize the controller's OS path. The hook-only tests cannot prove that
+// sending waits for the import or preserves the draft when it fails (unit).
+it.each([
+  { success: true, pasteOnly: false },
+  { success: false, pasteOnly: false },
+  { success: true, pasteOnly: true },
+])('waits for a remote folder copy before sending ($success, pasteOnly=$pasteOnly)', async ({ success, pasteOnly }) => {
+  supplyRangeGeometry();
+  let finish!: (result: { ok: true; path: string } | { ok: false; code: string }) => void;
+  h.uploadChatFolder.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+  const onSend = vi.fn().mockResolvedValue(true);
+  function RemoteComposer() {
+    const attachmentState = useAttachments(undefined, 'composer-regression');
+    return <>
+      <button onClick={() => attachmentState.addFolderPath('/controller/docs')}>Drop folder</button>
+      <ChatInput draftKey="composer-regression" deviceLinkDeviceId="target"
+        sessionId="remote-folder-session" initialModel="gpt-6-sol"
+        attachmentState={attachmentState} hideRuntimeControls showFolderPicker={false}
+        disableAutofocus onSend={onSend} />
+    </>;
+  }
+  const view = render(<RemoteComposer />);
+  await waitFor(() => expect(h.editor).not.toBeNull());
+  if (pasteOnly) {
+    fireEvent.paste(h.editor!.view.dom, { clipboardData: {
+      items: [{ kind: 'file', getAsFile: () => new File([], 'docs'),
+        webkitGetAsEntry: () => ({ isDirectory: true }) }],
+      getData: () => '',
+    } });
+  } else {
+    await act(async () => h.editor!.commands.setContent('<p>Read this folder</p>'));
+    fireEvent.click(screen.getByRole('button', { name: 'Drop folder' }));
+  }
+  await waitFor(() => expect(h.uploadChatFolder).toHaveBeenCalledOnce());
+  expect(view.container.querySelector('[data-kind="dir"]')).toBeNull();
+  expect(h.editor!.isEditable).toBe(true);
+  fireEvent.click(screen.getByRole('button', { name: 'newChat.sendButton.send' }));
+  await waitFor(() => expect(h.editor!.isEditable).toBe(false));
+  expect(onSend).not.toHaveBeenCalled();
+  await act(async () => finish(success
+    ? { ok: true, path: '/target/attachments/docs' }
+    : { ok: false, code: 'TRANSFER_FAILED' }));
+  if (success) {
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+    const sent = JSON.stringify(onSend.mock.calls[0]);
+    expect(sent).toContain('/target/attachments/docs');
+    expect(sent).not.toContain('/controller/docs');
+  } else {
+    expect(onSend).not.toHaveBeenCalled();
+    expect(h.editor!.getText()).toContain('Read this folder');
+    expect(screen.getByText('chat.remoteFile.folderFailed')).toBeTruthy();
+    h.uploadChatFolder.mockResolvedValue({ ok: true, path: '/target/attachments/docs' });
+    fireEvent.click(screen.getByRole('button', { name: 'Drop folder' }));
+    await waitFor(() => expect(view.container.querySelector('[data-kind="dir"]')?.getAttribute('data-path')).toBe('/target/attachments/docs'));
+    expect(screen.queryByText('chat.remoteFile.folderFailed')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'newChat.sendButton.send' }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+  }
+});
+
+it.each(['cancel', 'switch'] as const)('does not insert a late folder path after %s', async action => {
+  supplyRangeGeometry();
+  let finish!: (result: { ok: true; path: string }) => void;
+  h.uploadChatFolder.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+  function RemoteComposer({ device = 'target' }: { device?: string }) {
+    const attachmentState = useAttachments(undefined, 'composer-regression');
+    return <>
+      <button onClick={() => attachmentState.addFolderPath('/controller/docs')}>Drop folder</button>
+      <ChatInput draftKey="composer-regression" deviceLinkDeviceId={device}
+        sessionId="remote-folder-session" initialModel="gpt-6-sol"
+        attachmentState={attachmentState} hideRuntimeControls showFolderPicker={false}
+        disableAutofocus onSend={vi.fn()} />
+    </>;
+  }
+  const view = render(<RemoteComposer />);
+  await waitFor(() => expect(h.editor).not.toBeNull());
+  fireEvent.click(screen.getByRole('button', { name: 'Drop folder' }));
+  await waitFor(() => expect(h.uploadChatFolder).toHaveBeenCalledOnce());
+  if (action === 'cancel') {
+    fireEvent.click(screen.getByRole('button', { name: 'chat.remoteFile.cancelTransfer' }));
+  } else {
+    view.rerender(<RemoteComposer device="another-computer" />);
+  }
+  await act(async () => finish({ ok: true, path: '/target/attachments/docs' }));
+  expect(view.container.querySelector('[data-kind="dir"]')).toBeNull();
+});
+
+it('keeps a folder dragged from the remote task browser as a reference without uploading', async () => {
+  supplyRangeGeometry();
+  function RemoteComposer() {
+    const attachmentState = useAttachments(undefined, 'composer-regression');
+    return <>
+      <button onClick={() => attachmentState.addFolderPath('docs', 'task')}>Reference folder</button>
+      <ChatInput draftKey="composer-regression" deviceLinkDeviceId="target"
+        attachmentState={attachmentState} hideRuntimeControls showFolderPicker={false}
+        disableAutofocus onSend={vi.fn()} />
+    </>;
+  }
+  const view = render(<RemoteComposer />);
+  await waitFor(() => expect(h.editor).not.toBeNull());
+  fireEvent.click(screen.getByRole('button', { name: 'Reference folder' }));
+  await waitFor(() => expect(view.container.querySelector('[data-kind="dir"]')?.getAttribute('data-path')).toBe('docs'));
+  expect(h.uploadChatFolder).not.toHaveBeenCalled();
 });
 
 it('does not let a pending local resource scan repopulate an SSH composer', async () => {
