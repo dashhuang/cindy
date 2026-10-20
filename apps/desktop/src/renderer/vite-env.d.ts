@@ -2831,10 +2831,10 @@ interface ElectronAPI {
     chatCancel: (requestId: string) => Promise<void>;
     uploadChatFolder: (params: {
       deviceId: string;
-      sourcePath: string;
+      file: File;
       requestId: string;
     }) => Promise<
-      | { ok: true; path: string }
+      | { ok: true; path: string; size: number }
       | { ok: false; code: 'REMOTE_UNSUPPORTED' | 'TRANSFER_FAILED' }
     >;
     /** 聊天流文件 chip 点亮预检:远端精确 stat。file=点亮;nonfile=保持纯文本;unknown=乐观点亮。 */

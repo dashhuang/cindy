@@ -14,6 +14,9 @@ import {
   isDataOwnerGenerationCurrent,
 } from '@/contexts/dataOwnerGeneration';
 import type { PendingFolder } from '@/hooks/useAttachments';
+import type { AttachedFile } from '@/lib/fileTypes';
+import { CHAT_FOLDER_MIME } from '../../../shared/chatFolderAttachment';
+import { cleanupStagedChatAttachmentFiles } from '@/lib/chatAttachmentStageCleanup';
 
 interface Transfer {
   id: string;
@@ -31,6 +34,7 @@ export function useComposerFolderTransfers(options: {
   deviceId?: string | null;
   remoteHostId?: string | null;
   insert(path: string, name: string): void;
+  attach(file: AttachedFile): void;
 }) {
   const { t } = useTranslation();
   const [rows, setRows] = useState<Transfer[]>([]);
@@ -54,7 +58,10 @@ export function useComposerFolderTransfers(options: {
       const target = current.current;
       const source = typeof pending === 'string' ? pending : pending.path;
       const name = source.split(/[\\/]/).filter(Boolean).at(-1) ?? source;
-      if (typeof pending !== 'string' || (!target.deviceId && !target.remoteHostId)) {
+      if (
+        (typeof pending !== 'string' && pending.source === 'task') ||
+        (!target.deviceId && !target.remoteHostId)
+      ) {
         target.insert(source, name);
         return;
       }
@@ -108,14 +115,28 @@ export function useComposerFolderTransfers(options: {
           try {
             if (!target.deviceId || target.remoteHostId || isSharedTaskPeer(target.deviceId))
               throw new Error('CONNECTION_UNSUPPORTED');
+            if (typeof pending === 'string' || pending.source !== 'local')
+              throw new Error('TRANSFER_FAILED');
             const result = await window.electronAPI.fileBrowser.uploadChatFolder({
               deviceId: target.deviceId,
-              sourcePath: source,
+              file: pending.file,
               requestId: job.id,
             });
-            if (job.cancelled || !isCurrent()) return false;
+            if (job.cancelled || !isCurrent()) {
+              if (result.ok) cleanupStagedChatAttachmentFiles([{ path: result.path }]);
+              return false;
+            }
             if (!result.ok) throw new Error(result.code);
-            target.insert(result.path, name);
+            target.attach({
+              id: job.id,
+              name,
+              originalName: name,
+              path: result.path,
+              size: result.size,
+              category: 'file',
+              ext: '',
+              mimeType: CHAT_FOLDER_MIME,
+            });
             jobs.current.delete(job.id);
             refresh();
             return true;
@@ -150,9 +171,16 @@ export function useComposerFolderTransfers(options: {
   );
   const wait = useCallback(async () => {
     const scope = current.current.scope;
-    const pending = [...jobs.current.values()];
-    const results = await Promise.all(pending.map((job) => job.done));
-    return current.current.scope === scope && results.every(Boolean);
+    const owner = getDataOwnerGeneration();
+    while (current.current.scope === scope && isDataOwnerGenerationCurrent(owner)) {
+      const pending = [...jobs.current.values()];
+      if (!pending.length) return true;
+      const results = await Promise.all(pending.map((job) => job.done));
+      if (!results.every(Boolean)) return false;
+      // Outer chat drop zones can enqueue another folder while Send is waiting.
+      // Drain those jobs too before allowing the editor snapshot to be sent.
+    }
+    return false;
   }, []);
   return { rows, add, remove, wait, hasPending: rows.length > 0 };
 }

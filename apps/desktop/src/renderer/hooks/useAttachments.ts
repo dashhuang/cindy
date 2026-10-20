@@ -57,7 +57,7 @@ export interface AttachmentRejection {
   message: string;
 }
 
-export type PendingFolder = string | { path: string; source: 'task' };
+export type PendingFolder = string | { path: string; source: 'task' } | { path: string; source: 'local'; file: File };
 
 export interface UseAttachmentsReturn {
   attachments: AttachedFile[];
@@ -75,7 +75,7 @@ export interface UseAttachmentsReturn {
   /** Clear all inline rejections. */
   clearRejections: () => void;
   /** Queue a folder path for insertion as an @dir mention chip. */
-  addFolderPath: (folderPath: string, source?: 'task') => void;
+  addFolderPath: (folderPath: string, source?: 'task' | File) => void;
   /** Bumps whenever a pending folder path is queued. */
   pendingFoldersVersion: number;
   /** Drain and return all queued folder paths (clears the queue). */
@@ -421,9 +421,10 @@ export function useAttachments(sessionId?: string, draftKey?: string): UseAttach
   const pendingFoldersRef = useRef<PendingFolder[]>([]);
   const [pendingFoldersVersion, setPendingFoldersVersion] = useState(0);
 
-  const addFolderPath = useCallback((folderPath: string, source?: 'task') => {
+  const addFolderPath = useCallback((folderPath: string, source?: 'task' | File) => {
     pendingFoldersRef.current = [...pendingFoldersRef.current,
-      source === 'task' ? { path: folderPath, source } : folderPath];
+      source === 'task' ? { path: folderPath, source }
+        : source ? { path: folderPath, source: 'local', file: source } : folderPath];
     setPendingFoldersVersion((version) => version + 1);
   }, []);
 

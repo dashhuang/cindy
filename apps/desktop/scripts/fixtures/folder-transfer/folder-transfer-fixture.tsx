@@ -8,10 +8,10 @@ function Fixture() {
   const [removed, setRemoved] = useState<string[]>([]);
   const rows: ComponentProps<typeof ComposerFolderTransfers>['rows'] = [
     {
-      id: 'upload',
+      id: 'pack',
       source: '/example',
       name: 'Project materials — design and reference documents',
-      message: t('chat.remoteFile.folderUploading', { percent: 64, speed: '12.4 MB/s' }),
+      message: t('chat.remoteFile.folderPacking', { size: '12.4 MB' }),
       failed: false,
       cancelled: false,
       cancel() {},

@@ -74,11 +74,6 @@ import { throwIpcError } from '../utils/ipcValidate.js';
 import { uploadLocalFile } from '../device-link/mediaTransfer.js';
 import { pushToTopicSubscribers } from '../device-link/dispatch.js';
 import { getDeviceLinkInvokeContext } from '../device-link/invoke-context.js';
-import { activeOwnerScopeKey, ownerScopedUserDataPath } from '../appSessionState.js';
-import { FolderImports } from './chat-folder-transfer.js';
-import { parseRemoteAttachmentRef } from '../device-link/remoteAttachment.js';
-import { takePeerAttachment } from '../device-link/peerAttachmentStore.js';
-import { downloadToFile, removeRemote } from '../device-link/mediaTransfer.js';
 import { sharedTaskFileOperation } from '../device-link/sharedTaskDispatch.js';
 import { assertSharedTaskWorkdir } from '../device-link/sharedTaskFileAccess.js';
 import { getSafeDataOwnerPushStamp } from '../device-link/broadcast-tap.js';
@@ -94,24 +89,6 @@ import {
 } from './dir-export.js';
 
 const log = createLogger('file-browser/device-op');
-const folderImports = new FolderImports({
-  owner: activeOwnerScopeKey,
-  root: () => ownerScopedUserDataPath('chat-folder-attachments'),
-  receive: async (controller, part, destination, signal) => {
-    signal.throwIfAborted();
-    const ref = parseRemoteAttachmentRef(part.ref)!;
-    if (ref.peer) {
-      await takePeerAttachment(controller, ref.peer, destination);
-    } else {
-      try {
-        await downloadToFile(ref.ossKey, destination,
-          { size: part.size, sha256: part.sha256 }, undefined, signal);
-      } finally {
-        void removeRemote(ref.ossKey).catch(() => {});
-      }
-    }
-  },
-});
 
 /**
  * readFile 内容的 device-link 上限。量纲必须与帧限一致:relay 单帧
@@ -452,26 +429,8 @@ async function handleRemoteOp(args: RemoteOpArgs): Promise<unknown> {
       completeDirectoryListing: true as const,
       fileRead: true as const,
       dirExport: true as const,
-      folderImport: !sharedTask,
+      folderAttachment: !sharedTask,
     };
-  }
-  // Imports only write an owner-scoped attachment copy. No caller-chosen destination,
-  // and no working directory is needed for a new remote task's draft.
-  if (['importDirStart', 'importDirStatus', 'importDirCancel'].includes(args.op)) {
-    const ctx = getDeviceLinkInvokeContext();
-    if (!ctx?.controllerDeviceId || ctx.sharedTask) return bad('REMOTE_UNSUPPORTED');
-    try {
-      if (args.op === 'importDirStart') return {
-        ok: true, transferId: folderImports.start(ctx.controllerDeviceId, args.name, args.file),
-      };
-      if (args.op === 'importDirCancel') {
-        await folderImports.cancel(ctx.controllerDeviceId, args.transferId ?? '');
-        return { ok: true };
-      }
-      return { ok: true, ...folderImports.status(ctx.controllerDeviceId, args.transferId ?? '') };
-    } catch {
-      return bad('FOLDER_IMPORT_FAILED');
-    }
   }
   const guardResult = await checkRemoteWorkingDir(args.workdir);
   if (!guardResult.allowed && guardResult.reason === 'invalid') {

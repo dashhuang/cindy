@@ -54,6 +54,8 @@ import {
   isInsideCacheDir,
   putCachedContent,
   sweepCacheOnStartup,
+  stageLocalFileToCache,
+  cleanupOwnedUnpersistedStagedChatAttachments,
 } from './remote-file-cache.js';
 import {
   fetchChatFile,
@@ -73,8 +75,7 @@ import { watcherManager, type FileTreeEvent } from './watcher.js';
 import { registerHtmlPreviewIpc } from './html-preview-ipc.js';
 import { statSshPreviewMetadata } from './html-preview-read.js';
 import { toWorkdirRel } from '../../shared/workdirPath.js';
-import { activeOwnerScopeKey, isAppSessionBoundaryPending } from '../appSessionState.js';
-import { createDirExportDeps } from './dir-export.js';
+import { activeOwnerScopeKey, getActiveAppSession, isAppSessionBoundaryPending } from '../appSessionState.js';
 import { uploadChatFolder, type ChatFolderUploadArgs } from './chat-folder-transfer.js';
 import { parseSharedTaskPeer } from '@cindy/device-link';
 
@@ -656,6 +657,7 @@ export function registerFileBrowserIpc(): void {
   ipcMain.handle(FILE_BROWSER_INVOKE.CHAT_FOLDER_UPLOAD, async (event, args: ChatFolderUploadArgs) => {
     assertTrustedAppRendererEvent(event);
     const owner = activeOwnerScopeKey();
+    const ownerId = getActiveAppSession().dataOwnerId;
     const transfer = beginChatTransfer(event.sender, args?.requestId);
     const assertCurrent = () => {
       assertTrustedAppRendererEvent(event);
@@ -668,14 +670,15 @@ export function registerFileBrowserIpc(): void {
       if (!event.sender.isDestroyed()) event.sender.send(FILE_BROWSER_PUSH.TRANSFER, value);
     });
     try {
-      if (!fileTransferRequestId(args?.requestId) || !args?.deviceId ||
+      if (!ownerId || !fileTransferRequestId(args?.requestId) || !args?.deviceId ||
           parseSharedTaskPeer(args.deviceId)) throw new Error('REMOTE_UNSUPPORTED');
-      const uploadedPath = await uploadChatFolder(args, {
-        ...createDirExportDeps(), assertCurrent,
+      const prepared = await uploadChatFolder(args, {
+        tempRoot: () => app.getPath('temp'), assertCurrent,
+        stage: params => stageLocalFileToCache({ ...params, ownerId }),
+        discard: filePath => cleanupOwnedUnpersistedStagedChatAttachments({ ownerId, filePaths: [filePath] }),
         op: (deviceId, request) => deviceOpInvoke(deviceId, request),
       }, progress, transfer.signal);
-      assertCurrent();
-      return { ok: true as const, path: uploadedPath };
+      return { ok: true as const, ...prepared };
     } catch (error) {
       return { ok: false as const, code: String(error).includes('REMOTE_UNSUPPORTED')
         ? 'REMOTE_UNSUPPORTED' as const : 'TRANSFER_FAILED' as const };

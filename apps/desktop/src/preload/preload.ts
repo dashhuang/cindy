@@ -30,6 +30,7 @@ import {
 } from '../shared/loginItem';
 import type { BotToolsetContext } from '../shared/botRemoteCapabilities';
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
+import { createChatFolderUpload } from './chatFolderUpload';
 import { DESKTOP_LOCAL, type RemoteDesktopApi } from '../shared/remoteDesktop';
 import { DEVICE_LINK_PUSH } from '../shared/deviceLinkIpc';
 import { PROVIDER_SHARE_IPC, type ProviderShareCommand } from '../shared/providerShare';
@@ -3067,14 +3068,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     /** 取消进行中的 chatFetch / chatDownload(按发起时的 requestId);已结束时无操作。 */
     chatCancel: (requestId: string): Promise<void> =>
       ipcRenderer.invoke('maker:chat-file:cancel', requestId),
-    uploadChatFolder: (params: {
-      deviceId: string;
-      sourcePath: string;
-      requestId: string;
-    }): Promise<
-      | { ok: true; path: string }
-      | { ok: false; code: 'REMOTE_UNSUPPORTED' | 'TRANSFER_FAILED' }
-    > => ipcRenderer.invoke('maker:chat-folder:upload', params),
+    uploadChatFolder: createChatFolderUpload(
+      (file) => webUtils.getPathForFile(file),
+      (params) => ipcRenderer.invoke('maker:chat-folder:upload', params),
+    ),
     /** 聊天流文件 chip 点亮预检:远端精确 stat。file=点亮;nonfile=保持纯文本;unknown=乐观点亮。 */
     chatStat: (params: {
       origin: { kind: 'device'; deviceId: string } | { kind: 'ssh'; remoteHostId: string };

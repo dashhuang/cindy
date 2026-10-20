@@ -49,7 +49,7 @@ describe('shouldShowComposerPromptRecommendation', () => {
 
   it('推荐可见时启用发送，并在点击后直接作为正文发送', () => {
     expect(CHAT_INPUT_SOURCE).toContain(
-      'const canSend = hasComposerPayload || showRecommendationOverlay;',
+      'const canSend = hasComposerPayload || showRecommendationOverlay || folderTransfers.hasPending;',
     );
 
     const acceptStart = CHAT_INPUT_SOURCE.indexOf('const acceptPromptRecommendation = useCallback');
