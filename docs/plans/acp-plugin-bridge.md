@@ -319,6 +319,7 @@ Node Host（`apps/host`）。插件引擎任务的消息按 `agent_kind = 'acp'`
 - **范围**：协同仅限本机插件引擎任务；跨电脑运行的插件引擎（`agentDeviceId` 非空）与 SSH Lead 仍拒绝当 Lead（`PLUGIN_ENGINE_CANNOT_LEAD`），
   缺少 HTTP MCP 能力的插件引擎拒绝当 Lead（`PLUGIN_ENGINE_LEAD_TOOLS_UNSUPPORTED`）。休眠的任务（没有活会话）在建团队前先探测引擎：
   已有原生会话而引擎既不能 `session/resume` 也不能 `session/load` 时同样拒绝，不会先建团队再唤不醒 Lead；探测拿不到引擎确认退出时按失败处理。
+  探测只读 `initialize`，按任务所属的引擎（账号拆成独立供应商 `<引擎>~<后缀>` 的任务同样取其引擎）用原有登录启动，不依赖任务绑定的账号状态。
   插件引擎 Worker 只在 Lead 所在的这台电脑运行；
   SSH Lead、另一台工作电脑、Agent 在另一台电脑、worktree 都明确拒绝（创建面板选了 worktree 时直接提示，不能提交）。Lead 不能用
   `set_worker_runtime` 改插件引擎 Worker 的模型，需在它自己的任务窗口里改。
