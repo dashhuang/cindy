@@ -255,6 +255,8 @@ import { listPluginEngineViews, pluginEngineDescriptors, pluginEngineModelsOf, p
 import { pluginEngineRemoteUse, setPluginEngineRemoteUse } from '../maker-host/pluginEngineRemoteUse.js';
 import { onPluginEnginePrefsChanged, readPluginEnginePrefs, updatePluginEnginePrefs } from '../maker-host/plugin-engine-prefs-store.js';
 import { admitPluginEngineSession, admitPluginEngineSwitchTarget } from './pluginEngineSessionAdmission.js';
+import { probePluginHarnessLeadSupport } from '../maker-host/acp-host.js';
+import { acpLeadHarnessKey, createDormantAcpLeadPreflight, revokeAcpLeadIfTeamEnded } from './acpLeadPreflight.js';
 import { getPluginHarnessRegistry } from '../cindy-brain/pluginHarnesses.js';
 import {
   isPluginEngineKind,
@@ -1212,15 +1214,19 @@ import {
 } from './sendToSessionExecutionConfig.js';
 import { registerOrcaWorkerControlHandlers } from './orcaWorkerControlHandlers.js';
 import {
+  clearAcpLeadTeamBriefed,
   clearOrcaMcpHydrated,
+  isAcpLeadTeamBriefed,
   isOrcaMcpHydrated,
   knownNonOrcaSessionIds,
+  markAcpLeadTeamBriefed,
   markOrcaMcpHydratedIfNeeded,
   markKnownNonOrcaIfApplicable,
 } from './orcaMcpHydrationCache.js';
 import {
   applyOrcaInstructions,
   renderOrcaRoleInstructions,
+  resolveOrcaRoleInstructions,
   synthesizeOrcaVendorOptionsFromDb,
 } from './orcaSessionStartOptions.js';
 import {
@@ -1732,6 +1738,16 @@ import {
 import { installSessionTurnObserver } from './sessionTurnObserver.js';
 
 const log = createLogger('maker-ipc');
+const dormantAcpLeadPreflight = createDormantAcpLeadPreflight({
+  engineState: (harnessKey) => getPluginHarnessRegistry().list().find((entry) => entry.key === harnessKey)?.availability.state,
+  probe: (harnessKey) => probePluginHarnessLeadSupport(harnessKey, app.getVersion()),
+  onProbeFailed: (harnessKey, error) => {
+    log.warn('assertLeadCollabProjectEnabled: dormant ACP Lead preflight failed', {
+      harnessKey,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  },
+});
 const workdirLog = createLogger('workdir-diagnostics');
 const workingDirectoryRecovery = createWorkingDirectoryRecovery({
   stat: statWorkingDirectory,
@@ -7244,6 +7260,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       // 新控制端只有看到此位，才对这台电脑上的运行设备 Worker(Lead 在另一台电脑)列出其他电脑与
       // 分享、允许换 Agent 所在电脑。更早的 host 会以 UNSUPPORTED_CAPABILITY 拒绝，缺省 false 时不提供。
       supportsOrcaRemoteWorkerAgentRelocation: true,
+      // Local ACP plugin engine tasks can act as Orca collaboration Leads on this host.
+      supportsPluginEngineLead: true,
       // 调度更新支持 intervalMs:null 的显式清空表达(IPC 入口归一化成引擎的
       // 「带 key 的 undefined」)。旧 desktop 缺省为 false——旧引擎会把 null 当
       // 已设间隔算出 now+null 立即触发,mobile 必须据此回退旧 wire 形态(省略
@@ -8791,6 +8809,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     assertCurrent();
     await assertReviewSettingsUnlocked(sessionId);
     assertCurrent();
+    if (orcaRole === 'lead') {
+      // Fence against disableOrca finishing while a resume/rehydrate is still in flight:
+      // never rewrite orca_role='lead' after the active team has already been ended.
+      const activeTeam = await getActiveTeamByLead(sessionId);
+      assertCurrent();
+      if (!activeTeam) return;
+    }
     if (orcaRole === 'worker') {
       markKnownOrcaWorkerSession(sessionId);
       clearSuppressedOrcaWorkerAgentIslandSession(sessionId);
@@ -9099,14 +9124,56 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     await applyPersistedReviewMode(o);
     assertAccess?.();
     const didInjectOrcaInstructions = o.reviewMode === true ? false : await applyOrcaInstructions(o);
-    // Plugin engines get no Cindy system prompt (docs/plans/acp-plugin-bridge.md). A collaboration
-    // Worker cannot work without its role instructions, so they travel ahead of its first message,
-    // and the engine is trusted as a whole to report to its Lead (user decision 2026-11-19).
-    if (o.agentKind === 'acp' && o.reviewMode !== true && o.vendorOptions?.orcaRole === 'worker') {
-      const briefing = renderOrcaRoleInstructions(o);
-      if (briefing) {
-        o.pluginEngineBriefing = briefing;
-        o.pluginEngineTrustedCaller = true;
+    // True once an ACP Lead is briefed for its active team; the team is read again once its engine is open.
+    let acpLeadBriefed = false;
+    // Plugin engines get no Cindy system prompt (docs/plans/acp-plugin-bridge.md). Collaboration
+    // Leads and Workers receive their role instructions ahead of the first prompt (or once on
+    // promotion/restart resume for Leads). Only Workers receive pluginEngineTrustedCaller so
+    // orca_worker_bridge can authorize reports; Leads keep standard unattested caller provenance.
+    if (o.agentKind === 'acp' && o.reviewMode !== true) {
+      const role = o.vendorOptions?.orcaRole;
+      if (role === 'worker') {
+        const briefing = renderOrcaRoleInstructions(o);
+        if (briefing) {
+          o.pluginEngineBriefing = briefing;
+          o.pluginEngineTrustedCaller = true;
+        }
+      } else if (role === 'lead') {
+        const activeTeam = o.id ? await getActiveTeamByLead(o.id) : null;
+        assertAccess?.();
+        if (!activeTeam) {
+          // No active team in DB (e.g. caller spoofed vendorOptions or disableOrca finished concurrently):
+          // clear stale Lead markers instead of bootstrapping an orphaned ACP Lead.
+          o.orcaRole = null;
+          if (o.vendorOptions) {
+            const restVendor = { ...o.vendorOptions };
+            delete restVendor.orcaRole;
+            delete restVendor.orcaWorkflowId;
+            delete restVendor.orcaLeadSessionId;
+            delete restVendor.initialWorker;
+            o.vendorOptions = restVendor;
+          }
+        } else {
+          o.vendorOptions = {
+            ...(o.vendorOptions ?? {}),
+            orcaRole: 'lead',
+            orcaWorkflowId: activeTeam.id,
+            ...(o.id ? { orcaLeadSessionId: o.id } : {}),
+          };
+          acpLeadBriefed = true;
+          const briefing = renderOrcaRoleInstructions(o);
+          if (briefing) {
+            o.pluginEngineBriefing = briefing;
+            const briefedSessionId = o.id;
+            const briefedTeamId = activeTeam.id;
+            o.pluginEngineOnBriefingDelivered = () => {
+              if (briefedSessionId) markAcpLeadTeamBriefed(briefedSessionId, briefedTeamId);
+            };
+            if (o.resumeSessionId && o.id && !isAcpLeadTeamBriefed(o.id, activeTeam.id)) {
+              o.pluginEngineForceBriefingOnResume = true;
+            }
+          }
+        }
       }
     }
     const didInjectProjectContext =
@@ -9364,6 +9431,34 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       }
       await reconnectHandoff.commit();
       reconnectHandoff = undefined;
+    }
+    // The Lead's team was read before the engine opened. A team that ended during the open found no runtime to
+    // clear (it is published after the open), so repeat the check made before the open instead of leaving the
+    // closed team's role and briefing to the first ordinary message. The session is already published here, so
+    // a failed read keeps the role as it is rather than fail the open.
+    if (acpLeadBriefed) {
+      const leadId = session.id;
+      let revoked = false;
+      try {
+        revoked = await revokeAcpLeadIfTeamEnded({
+          hasActiveTeam: async () => Boolean(await getActiveTeamByLead(leadId)),
+          revokeRole: () => clearLeadOrcaRoleState(leadId, undefined, false),
+        });
+      } catch (err) {
+        log.warn('acp lead: team check after open failed; keeping the Lead role', {
+          sessionId: leadId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+      assertAccess?.();
+      if (revoked) {
+        o.orcaRole = null;
+        if (o.vendorOptions) {
+          const restVendor = { ...o.vendorOptions };
+          for (const key of ['orcaRole', 'orcaWorkflowId', 'orcaLeadSessionId', 'initialWorker']) delete restVendor[key];
+          o.vendorOptions = restVendor;
+        }
+      }
     }
     Object.assign(session, {
       sendToSessionHint: resolveAgentSendToSessionHint({
@@ -12130,10 +12225,38 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     if (leadRow?.orcaRole === 'worker' || leadRow?.orcaRemoteLead) {
       throwIpcError('PRECONDITION_FAILED', '[WORKER_CANNOT_NEST] a worker task cannot start collaboration');
     }
-    // A plugin engine can be a Worker but not yet a Lead (docs/plans/acp-plugin-bridge.md): it has
-    // no live role switch and receives no Lead instructions. Refuse every Lead entry here.
+    // Local plugin engines can act as Orca Lead (docs/plans/acp-plugin-bridge.md). Remote-hosted
+    // (another computer) and SSH plugin engines remain excluded, and a live engine without HTTP
+    // MCP cannot reach cindy_orca tools.
     if (lead?.agentKind === 'acp' || leadRow?.agentKind === 'acp') {
-      throwIpcError('UNSUPPORTED_CAPABILITY', '[PLUGIN_ENGINE_CANNOT_LEAD] a plugin engine task cannot start collaboration yet; switch the task to a built-in engine first');
+      if (lead?.remoteHostId || leadRow?.remoteHostId || lead?.agentDeviceId || leadRow?.agentDeviceId) {
+        throwIpcError(
+          'UNSUPPORTED_CAPABILITY',
+          '[PLUGIN_ENGINE_CANNOT_LEAD] a plugin engine task running on another computer cannot start collaboration yet; run the task locally or switch to a built-in engine first',
+        );
+      }
+      if (
+        lead?.agentKind === 'acp'
+        && (
+          lead.pluginEngineHttpMcpSupported === false
+          || (lead.pluginEngineHasOrcaMcp === false && lead.pluginEngineResumeSupported === false)
+        )
+      ) {
+        throwIpcError(
+          'UNSUPPORTED_CAPABILITY',
+          '[PLUGIN_ENGINE_LEAD_TOOLS_UNSUPPORTED] this plugin engine does not support HTTP MCP collaboration tools on this session, so it cannot act as a collaboration Lead',
+        );
+      }
+      if (!lead) {
+        // Dormant ACP Lead (e.g. after app restart): preflight the plugin harness before committing
+        // a team or creating a Worker so engines that cannot lead fail cleanly with zero side effects.
+        // A task that already has a native session has to be reopened to become a Lead.
+        const refusal = await dormantAcpLeadPreflight(
+          acpLeadHarnessKey(leadRow?.providerId),
+          Boolean(leadRow?.sdkSessionId),
+        );
+        if (refusal) throwIpcError(refusal.code, refusal.message);
+      }
     }
     const rawWorkingDir =
       typeof leadRow?.workingDir === 'string' ? leadRow.workingDir : lead?.workDir;
@@ -15775,7 +15898,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     createId,
     getSessionMeta: (sessionId) => maker.getSessionMeta(sessionId).catch(() => null),
     getSessionRowSnapshot,
-    getLiveSession: (sessionId) => builtinLiveSession(sessionId),
+    getLiveSession: (sessionId) => maker.getSession(sessionId),
     recycleProjectResourceRuntime: async (sessionId) => {
       const current = maker.getSession(sessionId);
       if (current?.agentKind !== 'pi' || current.hasRecyclableProjectResourceDrift() !== true) return false;
@@ -15899,7 +16022,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
   // Agent 选择的排队行插话 / 排序(cindy_orca 与 cindy_helper 共用)。
   const { steerStoredControlMessage, moveStoredControlMessage } = createQueueReorderAdapter({
-    getLiveSession: (sessionId) => builtinLiveSession(sessionId),
+    getLiveSession: (sessionId) => maker.getSession(sessionId),
     hasSendToSessionLock: (sessionId) => sendToSessionLocks.has(sessionId),
     // inputCoordinator 在本函数更后面才声明,只能在调用时取用。
     getCoordinator: () => inputCoordinator,
@@ -16069,6 +16192,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     await assertCurrent?.();
     if (persistRole) await setSessionOrcaRole(leadSessionId, null);
     knownNonOrcaSessionIds.delete(leadSessionId);
+    clearOrcaMcpHydrated(leadSessionId);
+    clearAcpLeadTeamBriefed(leadSessionId);
 
     const leadSess = maker.getSession(leadSessionId);
     if (leadSess) {
@@ -16816,9 +16941,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       return {
         ...readLeadProviderGroupEntry(leadRow.id, leadRow.remoteHostId),
         id: leadRow.id,
-        // 走转换正本:pi lead 不能被压成 claude-code,否则 input.agent===lead.agentKind
-        // 判等失效,pi-lead 建 pi-worker 会走错默认分支(见 orcaWorkerCreationService)。
-        agentKind: dbToMakerAgentKind(leadRow.agentKind),
+        // 走转换正本:pi / acp lead 不能被压成 claude-code,否则 input.agent===lead.agentKind
+        // 判等失效,acp-lead 建 claude-code worker 会误继承插件模型/来源。
+        agentKind: dbToMakerEngineKind(leadRow.agentKind),
         workspaceKind: leadRow.workspaceKind,
         workingDir: leadRow.workingDir,
         model: leadRow.model,
@@ -18396,6 +18521,11 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     consumeWorkingDirectoryRecoveryNote: (sessionId, note) =>
       workingDirectoryRecovery.consume(sessionId, note),
     isOrcaMcpHydrated,
+    renderOrcaRoleInstructions,
+    resolveOrcaRoleInstructions,
+    markOrcaMcpHydratedIfNeeded,
+    markAcpLeadTeamBriefed,
+    getActiveOrcaTeamId: async (sessionId) => (await getActiveTeamByLead(sessionId))?.id ?? null,
     buildCreateOptsWithStderr,
     synthesizeOrcaVendorOptionsFromDb,
     readSessionExtraDirsFromDb,
