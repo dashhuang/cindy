@@ -920,6 +920,7 @@ export class AcpSession {
     this.turn = turn;
     this.usage = { ...this.usage, tokenUsage: 0 };
     this.emit([{ type: 'status', data: { status: 'running', ...this.usage, isRunning: true } }]);
+    const usageModel = this.model;
     const request = this.connection.request('session/prompt', { sessionId: this.id, prompt }, { timeoutMs: null });
     // The request line is written synchronously: a failed write (or an already closed connection) leaves
     // the connection closed, and then the briefing it carried has not reached the agent.
@@ -932,7 +933,7 @@ export class AcpSession {
       (result) => {
         // The prompt result is the only per-turn token report; `usage_update` only carries the context size.
         const usage = normalizeTurnUsage(result);
-        this.finishTurn(turn.token, { stopReason: normalizeStopReason(result), ...(usage ? { usage } : {}) });
+        this.finishTurn(turn.token, { stopReason: normalizeStopReason(result), ...(usage ? { usage, usageModel } : {}) });
       },
       (error: unknown) => this.finishTurn(turn.token, this.errorOutcome(error)),
     );
