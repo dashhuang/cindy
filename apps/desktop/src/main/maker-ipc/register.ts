@@ -12557,6 +12557,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
             .where(eq(sessions.id, dispatcherSessionId))
             .limit(1);
           const sourceAgentDeviceId = meta.agentDeviceId && !meta.remoteHostId ? meta.agentDeviceId : null;
+          const targetEngineKind = executionOverrides?.agentKind ?? meta.agentKind;
           const inheritedBase: SendToSessionCreateDefaults = {
             agentKind: meta.agentKind,
             workingDir: resolvedWorkDir,
@@ -12567,15 +12568,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
             effort: (row?.effort ?? undefined) as SendToSessionCreateDefaults['effort'],
             fastMode: (row?.fastMode ?? false),
             providerId: row?.providerId,
-            // working_dir 覆盖时强制继承来源会话的权限档(review 反馈):把新目录
-            // 以 Full access 打开是相对 dispatcher 的权限升级,跨项目 handoff
-            // 不应隐式发生;未覆盖时保持既有缺省(bypassPermissions)不变。
+            // 指定新目录或通过插件引擎派发时，子任务沿用来源权限。
             permissionMode:
               inheritSourcePermissionMode || workingDirOverride !== undefined
+                || meta.agentKind === 'acp' || targetEngineKind === 'acp'
                 ? permissionModeOrAsk(row?.permissionMode)
                 : 'bypassPermissions',
           };
-          const targetEngineKind: EngineKind = executionOverrides?.agentKind ?? inheritedBase.agentKind;
           if (targetEngineKind === 'acp') {
             const pluginRoute = resolveSendToSessionPluginEngineCreate({
               source: {

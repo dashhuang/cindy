@@ -1086,7 +1086,9 @@ describe('sendToSessionInternal create from plugin engine (#12127)', () => {
       model: 'gemini-4-neon',
     });
     expect(okHarness.opened).toHaveLength(1);
-    expect(okHarness.opened[0]).toMatchObject({ agentKind: 'acp', providerId: AGY_PROVIDER, model: 'gemini-4-neon' });
+    expect(okHarness.opened[0]).toMatchObject({ agentKind: 'acp', providerId: AGY_PROVIDER, model: 'gemini-4-neon', permissionMode: 'auto' });
+    expect(okHarness.bootstrapped[0]).toMatchObject({ permissionMode: 'auto', workingDir: '/tmp/proj' });
+    expect(okHarness.sentTo).toEqual([{ sessionId: 'new-child-1', planMode: false }]);
 
     const badHarness = makeAcpCreateHarness([agyHarness('unavailable', 'sign in required')]);
     const refused = await badHarness.sendToSessionInternal({
@@ -1116,6 +1118,7 @@ describe('sendToSessionInternal create from plugin engine (#12127)', () => {
       message: 'Run on codex',
       execution: { agentKind: 'codex', model: 'gpt-5.6-sol' },
     });
+    expect(h.bootstrapped[0]).toMatchObject({ agentKind: 'codex', permissionMode: 'auto' });
     expect(switched).toMatchObject({
       ok: true,
       agentKind: 'codex',
